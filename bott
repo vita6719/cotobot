@@ -1,0 +1,136 @@
+# index.py
+
+import json
+import random
+import telebot
+from telebot import types
+import boto3
+import io # Добавляем библиотеку для работы с потоками памяти
+
+from config import TG_BOT_TOKEN, YC_KEY_ID, YC_SECRET_KEY, BUCKET_NAME, ENDPOINT_URL
+
+# Инициализируем клиента S3
+s3_client = boto3.client(
+    's3',
+    endpoint_url=ENDPOINT_URL,
+    aws_access_key_id=YC_KEY_ID,
+    aws_secret_access_key=YC_SECRET_KEY
+)
+
+# Инициализируем бота
+bot = telebot.TeleBot(TG_BOT_TOKEN, parse_mode='Markdown')
+
+# --- ЛОКАЛИЗАЦИЯ (RU) ---
+MESSAGES = {
+    'ru': {
+        'welcome': "😸Привет, {name}! Я — пушистый КотоБот.\nОтправляю случайных, милых котов и котиков!\n\n\nПросто нажми кнопки ниже и сделай выбор, чтобы получить свою порцию пушистого настроения🫶",
+        'choose_category': "Выберите категорию:",
+        'realistic_btn': "Реалистичный котик 🐱",
+        'cartoon_btn': "Мультяшный котик 🎨",
+        'loading': "Загружаю картинку... ждите пушистое чудо ⏳",
+        'no_pics': "Извините, в этой папке (бакете) пока нет картинок 😿"
+    },
+}
+
+def get_messages(user_lang='ru'):
+    return MESSAGES.get(user_lang, MESSAGES['ru'])
+
+# --- ФУНКЦИЯ ДЛЯ ЧТЕНИЯ ИЗ S3 ---
+def get_random_image_from_s3_stream(prefix_folder):
+    """Получает случайное изображение в виде потока байтов из S3 бакета."""
+    
+    try:
+        objects = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=prefix_folder)
+        
+        if 'Contents' in objects:
+            all_files = [obj['Key'] for obj in objects['Contents'] if obj['Key'] != prefix_folder and obj['Key'].lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            # !!! НОВАЯ СТРОКА ДЛЯ ОТЛАДКИ !!!
+            print(f"DEBUG: Found files in list: {all_files}")
+            
+            if all_files:
+                random_file_key = random.choice(all_files)
+                print(f"DEBUG: Selected file key: {random_file_key}")
+                
+                # Скачиваем файл в память (как поток байтов)
+                s3_object = s3_client.get_object(Bucket=BUCKET_NAME, Key=random_file_key)
+                image_bytes = s3_object['Body'].read()
+                return image_bytes
+    except Exception as e:
+        print(f"ERROR S3 access: {e}")
+        return None
+    return None
+
+# --- (Остальные функции keyboard, send_welcome, callback_handler_cloud, handler остаются без изменений) ---
+# --- КНОПКИ ---
+def get_keyboard(lang_code='ru'):
+    msgs = get_messages(lang_code)
+    keyboard = types.InlineKeyboardMarkup()
+    btn_realistic = types.InlineKeyboardButton(text=msgs['realistic_btn'], callback_data="get_realistic")
+    btn_cartoon = types.InlineKeyboardButton(text=msgs['cartoon_btn'], callback_data="get_cartoon")
+    keyboard.add(btn_realistic, btn_cartoon)
+    return keyboard
+
+# --- ОБРАБОТЧИКИ СОБЫТИЙ (теперь они вызываются через handler) ---
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    msgs = get_messages('ru')
+    user_name = message.from_user.first_name or "друг"
+    welcome_text = msgs['welcome'].format(name=user_name) 
+    bot.reply_to(
+        message,
+        welcome_text,
+        reply_markup=get_keyboard('ru')
+    )
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler_cloud(call):
+    msgs = get_messages('ru')
+    bot.send_chat_action(call.message.chat.id, 'upload_photo')
+
+    if call.data == "get_realistic":
+        folder_prefix = 'realistic/'
+    elif call.data == "get_cartoon":
+        folder_prefix = 'cartoon/'
+    else:
+        return
+
+    # Получаем картинку как байты, а не URL
+    image_bytes = get_random_image_from_s3_stream(folder_prefix)
+
+    if not image_bytes:
+        bot.send_message(call.message.chat.id, msgs['no_pics'])
+        return
+    
+    try:
+        # Отправляем фото напрямую в Telegram
+        bot.send_photo(
+            chat_id=call.message.chat.id,
+            photo=io.BytesIO(image_bytes), # Используем поток байтов
+            reply_markup=get_keyboard('ru') 
+        )
+    except Exception as e:
+        print(f"ERROR sending photo to Telegram: {e}")
+        bot.send_message(call.message.chat.id, f"Критическая ошибка отправки фото Telegram'ом. Ошибка: {e}")
+
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ДЛЯ YANDEX CLOUD FUNCTIONS (Entry point) ---
+
+def handler(event, context):
+    if 'body' not in event:
+        return {'statusCode': 400, 'body': 'Bad Request'}
+    
+    try:
+        update = telebot.types.Update.de_json(event['body'])
+        bot.process_new_updates([update])
+        return {
+            'statusCode': 200,
+            'body': 'OK'
+        }
+    except Exception as e:
+        print(f"Error processing update: {e}")
+        return {
+            'statusCode': 500,
+            'body': 'Internal Server Error'
+        }
